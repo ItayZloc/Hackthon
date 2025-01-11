@@ -3,170 +3,157 @@ import struct
 import threading
 import time
 
+# Magic cookie and message types (do not modify)
 MAGIC_COOKIE = 0xabcddcba
-MSG_TYPE_OFFER   = 0x02
-MSG_TYPE_REQUEST = 0x03
-MSG_TYPE_PAYLOAD = 0x04
+MSG_TYPE_OFFER = 0x2
+MSG_TYPE_REQUEST = 0x3
+MSG_TYPE_PAYLOAD = 0x4
 
-# For a real LAN broadcast
-BROADCAST_IP   = "255.255.255.255"
+# Broadcast port where the server sends “offer” messages (the client must also listen on this port).
 BROADCAST_PORT = 13117
 
-SERVER_UDP_PORT = 20201
-SERVER_TCP_PORT = 20202
+# Frequency (in seconds) at which the server broadcasts its “offer” messages.
+BROADCAST_INTERVAL = 1.0
 
-UDP_PAYLOAD_CHUNK_SIZE = 1024
-TCP_SEND_CHUNK_SIZE    = 4096
+# Size of each UDP payload chunk. Adjust as needed.
+UDP_PAYLOAD_CHUNK = 10000
 
-def broadcast_offers(stop_event):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        while not stop_event.is_set():
-            try:
-                offer_msg = struct.pack("!IBHH",
-                    MAGIC_COOKIE,
-                    MSG_TYPE_OFFER,
-                    SERVER_UDP_PORT,
-                    SERVER_TCP_PORT
-                )
-                sock.sendto(offer_msg, (BROADCAST_IP, BROADCAST_PORT))
-            except Exception as e:
-                print(f"[Offer Thread] Error broadcasting offer: {e}")
-            stop_event.wait(timeout=1.0)
+# Buffer size for receiving UDP packets.
+UDP_BUFFER_SIZE = 65535
 
-def serve_one_udp_request(udp_sock, data, client_addr):
-    if len(data) < 13:
-        return
-    magic_cookie, msg_type, file_size = struct.unpack("!IBQ", data)
-    if magic_cookie != MAGIC_COOKIE or msg_type != MSG_TYPE_REQUEST:
-        return
+def broadcast_offers(udp_port, tcp_port, stop_event):
+    """
+    Continuously broadcasts an 'offer' message at fixed intervals.
+    """
+    broadcaster = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    broadcaster.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    print(f"[UDP] Got request from {client_addr}, file_size={file_size} bytes")
-    if file_size == 0:
-        return
+    # Build the offer packet: [magic_cookie (4 bytes)] [msg_type (1 byte)] [server_udp_port (2 bytes)] [server_tcp_port (2 bytes)]
+    offer_packet = struct.pack("!I B H H", MAGIC_COOKIE, MSG_TYPE_OFFER, udp_port, tcp_port)
 
-    num_segments = (file_size + UDP_PAYLOAD_CHUNK_SIZE - 1) // UDP_PAYLOAD_CHUNK_SIZE
-    bytes_left = file_size
-    for segment_index in range(num_segments):
-        header = struct.pack("!IBQQ",
-            MAGIC_COOKIE,
-            MSG_TYPE_PAYLOAD,
-            num_segments,
-            segment_index
-        )
-        chunk_size = min(UDP_PAYLOAD_CHUNK_SIZE, bytes_left)
-        payload_data = b'\x00' * chunk_size
-        packet = header + payload_data
+    while not stop_event.is_set():
         try:
-            udp_sock.sendto(packet, client_addr)
-        except Exception as e:
-            print(f"[UDP] Error sending segment {segment_index}: {e}")
-            break
-        bytes_left -= chunk_size
-        if bytes_left <= 0:
-            break
+            broadcaster.sendto(offer_packet, ("<broadcast>", BROADCAST_PORT))
+        except:
+            pass
+        time.sleep(BROADCAST_INTERVAL)
 
-    print(f"[UDP] Finished sending {file_size} bytes to {client_addr}")
+    broadcaster.close()
 
-def udp_request_listener(stop_event):
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    udp_sock.bind(("0.0.0.0", SERVER_UDP_PORT))
-    print(f"[UDP] Listening for requests on port {SERVER_UDP_PORT}...")
-
+def handle_tcp_connection(client_socket):
+    """
+    Receives the file-size request over TCP and responds with exactly that many bytes.
+    """
     try:
-        while not stop_event.is_set():
-            data, client_addr = udp_sock.recvfrom(2048)
-            threading.Thread(
-                target=serve_one_udp_request,
-                args=(udp_sock, data, client_addr),
-                daemon=True
-            ).start()
-    except OSError:
-        print("[UDP] Socket closed, shutting down UDP listener.")
-    finally:
-        udp_sock.close()
-
-def serve_one_tcp_client(client_sock, client_addr):
-    print(f"[TCP] Accepted connection from {client_addr}")
-    try:
-        file_size_str = ""
-        while True:
-            chunk = client_sock.recv(1024)
+        request_data = b""
+        while b"\n" not in request_data:
+            chunk = client_socket.recv(1024)
             if not chunk:
-                break
-            file_size_str += chunk.decode()
-            if "\n" in file_size_str:
-                break
+                return
+            request_data += chunk
 
-        file_size = int(file_size_str.strip() or "0")
-        print(f"[TCP] Client requests {file_size} bytes")
-
-        bytes_left = file_size
-        while bytes_left > 0:
-            chunk_size = min(TCP_SEND_CHUNK_SIZE, bytes_left)
-            data_to_send = b'\x00' * chunk_size
-            client_sock.sendall(data_to_send)
-            bytes_left -= chunk_size
-
-        print(f"[TCP] Finished sending {file_size} bytes to {client_addr}")
-    except Exception as e:
-        print(f"[TCP] Error during transfer: {e}")
-    finally:
-        client_sock.close()
-        print(f"[TCP] Connection closed with {client_addr}")
-
-def tcp_request_listener(stop_event):
-    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_sock.bind(("0.0.0.0", SERVER_TCP_PORT))
-    tcp_sock.listen(5)
-    print(f"[TCP] Listening for connections on port {SERVER_TCP_PORT}...")
-
-    try:
-        while not stop_event.is_set():
-            client_sock, client_addr = tcp_sock.accept()
-            threading.Thread(
-                target=serve_one_tcp_client,
-                args=(client_sock, client_addr),
-                daemon=True
-            ).start()
-    except OSError:
-        print("[TCP] Socket closed, shutting down TCP listener.")
-    finally:
-        tcp_sock.close()
-
-def main():
-    stop_event = threading.Event()
-
-    offer_thread = threading.Thread(target=broadcast_offers, args=(stop_event,), daemon=True)
-    offer_thread.start()
-
-    udp_thread = threading.Thread(target=udp_request_listener, args=(stop_event,), daemon=True)
-    udp_thread.start()
-
-    tcp_thread = threading.Thread(target=tcp_request_listener, args=(stop_event,), daemon=True)
-    tcp_thread.start()
-
-    print("[Server] Running on LAN. Ctrl+C to stop.")
-    try:
-        while True:
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        print("[Server] Stopping...")
-
-    stop_event.set()
-
-    # Force the UDP and TCP sockets to exit their blocking calls
-    try:
-        # Unblock UDP
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.sendto(b"stop", ("127.0.0.1", SERVER_UDP_PORT))
-        # Unblock TCP
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect(("127.0.0.1", SERVER_TCP_PORT))
+        requested_size = int(request_data.strip().decode())
+        dummy_payload = b"\x00" * requested_size
+        client_socket.sendall(dummy_payload)
     except:
         pass
+    finally:
+        client_socket.close()
 
-    print("[Server] Exiting.")
+def tcp_listener(tcp_socket):
+    """
+    Waits for incoming TCP connections; spawns a new thread for each request.
+    """
+    while True:
+        client_socket, _ = tcp_socket.accept()
+        thread = threading.Thread(target=handle_tcp_connection, args=(client_socket,))
+        thread.daemon = True
+        thread.start()
+
+def send_udp_payload(udp_socket, client_address, requested_size):
+    """
+    Sends UDP payload packets in sequence until the requested size is met.
+    """
+    total_segments = (requested_size + UDP_PAYLOAD_CHUNK - 1) // UDP_PAYLOAD_CHUNK
+    bytes_sent = 0
+    current_segment = 0
+
+    while bytes_sent < requested_size:
+        current_segment += 1
+        end_pos = min(bytes_sent + UDP_PAYLOAD_CHUNK, requested_size)
+        payload_data = b"\x00" * (end_pos - bytes_sent)
+
+        # Packet format: [magic_cookie (4)] [msg_type (1)] [total_segments (8)] [current_segment (8)] [payload ...]
+        header = struct.pack("!I B Q Q", MAGIC_COOKIE, MSG_TYPE_PAYLOAD, total_segments, current_segment)
+        try:
+            udp_socket.sendto(header + payload_data, client_address)
+        except:
+            break
+
+        bytes_sent = end_pos
+
+def udp_listener(udp_socket):
+    """
+    Listens for UDP "request" packets from the client and spawns a thread to send the payload.
+    """
+    while True:
+        data, addr = udp_socket.recvfrom(UDP_BUFFER_SIZE)
+        if len(data) < 5:
+            continue
+
+        cookie = struct.unpack("!I", data[:4])[0]
+        if cookie != MAGIC_COOKIE:
+            continue
+
+        msg_type = data[4]
+        if msg_type == MSG_TYPE_REQUEST and len(data) >= 13:
+            requested_size = struct.unpack("!Q", data[5:13])[0]
+            thread = threading.Thread(target=send_udp_payload, args=(udp_socket, addr, requested_size))
+            thread.daemon = True
+            thread.start()
+
+def main():
+    print("Server started, listening on IP 0.0.0.0")
+
+    # Create a TCP socket on a dynamic (ephemeral) port
+    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_socket.bind(("", 0))  # Port 0 => OS chooses an available port
+    tcp_socket.listen()
+    server_tcp_port = tcp_socket.getsockname()[1]
+
+    # Create a UDP socket on a dynamic (ephemeral) port
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_socket.bind(("", 0))  # Port 0 => OS chooses an available port
+    server_udp_port = udp_socket.getsockname()[1]
+
+    # Event to stop broadcasting (useful if you ever want to shut down gracefully)
+    stop_event = threading.Event()
+
+    # Start broadcasting offers
+    broadcaster_thread = threading.Thread(
+        target=broadcast_offers,
+        args=(server_udp_port, server_tcp_port, stop_event)
+    )
+    broadcaster_thread.daemon = True
+    broadcaster_thread.start()
+
+    # Start TCP listener thread
+    tcp_thread = threading.Thread(target=tcp_listener, args=(tcp_socket,))
+    tcp_thread.daemon = True
+    tcp_thread.start()
+
+    # Start UDP listener thread
+    udp_thread = threading.Thread(target=udp_listener, args=(udp_socket,))
+    udp_thread.daemon = True
+    udp_thread.start()
+
+    # Keep main thread alive
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\nServer shutting down...")
 
 if __name__ == "__main__":
     main()
